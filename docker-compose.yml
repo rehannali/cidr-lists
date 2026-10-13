@@ -1,0 +1,16 @@
+services:
+  tg-cidr:
+    build: .
+    restart: unless-stopped
+    environment:
+      REFRESH_HOURS: "24"
+      # Optional: serve under a secret path, e.g. https://cidr.example.com/k3x9q2/telegram-v4.txt
+      # PATH_PREFIX: "k3x9q2"
+    volumes:
+      - tg-cidr-data:/data
+    # No "ports:" needed. In Dokploy, add a Domain pointing at container port 8080.
+    expose:
+      - "8080"
+
+volumes:
+  tg-cidr-data:
