@@ -59,6 +59,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -397,31 +398,50 @@ def nextdns_domain(domain):
                     build(name, OUT_DIR)
 
 
-def nextdns_open(path, params):
+def nextdns_open(path, params, retries=4):
+    """Open an API URL. On 429 / 5xx wait (Retry-After if given) and retry."""
     query = urllib.parse.urlencode(params)
     req = urllib.request.Request(
         f"{NEXTDNS_API}/profiles/{path}?{query}",
         headers={"X-Api-Key": NEXTDNS_API_KEY, "User-Agent": "cidr-mirror/1.0"},
     )
-    return urllib.request.urlopen(req, timeout=300)
+    for attempt in range(retries + 1):
+        try:
+            return urllib.request.urlopen(req, timeout=300)
+        except urllib.error.HTTPError as exc:
+            if exc.code not in (429, 500, 502, 503, 504) or attempt == retries:
+                raise
+            retry_after = exc.headers.get("Retry-After", "")
+            wait = float(retry_after) if retry_after.isdigit() else 10 * 2**attempt
+            log.warning("nextdns: HTTP %s, waiting %.0fs", exc.code, wait)
+            time.sleep(wait)
+
+
+def nextdns_terms():
+    """Search terms for the API: the providers' domains, minus ones already covered by a shorter term."""
+    suffixes = {s for n in ENABLED for s in PROVIDERS[n].get("suffixes", [])}
+    return sorted(s for s in suffixes if not any(o != s and o in s for o in suffixes))
 
 
 def nextdns_backfill(profile, since="-1d"):
-    """Read logs since `since`. Returns the stream id to continue from."""
-    params = {"from": since, "limit": 1000}
+    """Read logs since `since`, asking the API only for matching domains (few requests,
+    paced one per second). Returns the stream id to continue from."""
     stream_id = None
-    for _ in range(100):
-        with nextdns_open(f"{profile}/logs", params) as resp:
-            body = json.load(resp)
-        for entry in body.get("data", []):
-            if entry.get("domain"):
-                nextdns_domain(entry["domain"])
-        meta = body.get("meta") or {}
-        stream_id = stream_id or (meta.get("stream") or {}).get("id")
-        cursor = (meta.get("pagination") or {}).get("cursor")
-        if not cursor:
-            break
-        params["cursor"] = cursor
+    for term in nextdns_terms():
+        params = {"from": since, "limit": 1000, "search": term}
+        for _ in range(20):
+            with nextdns_open(f"{profile}/logs", params) as resp:
+                body = json.load(resp)
+            for entry in body.get("data", []):
+                if entry.get("domain"):
+                    nextdns_domain(entry["domain"])
+            meta = body.get("meta") or {}
+            stream_id = stream_id or (meta.get("stream") or {}).get("id")
+            cursor = (meta.get("pagination") or {}).get("cursor")
+            time.sleep(1)
+            if not cursor:
+                break
+            params["cursor"] = cursor
     return stream_id
 
 
@@ -436,12 +456,15 @@ def nextdns_poll(profile):
             log.error("nextdns %s: poll failed: %s", profile, exc)
 
 
-def nextdns_watch(profile):
+def nextdns_watch(profile, start_delay=0):
+    time.sleep(start_delay)  # spread several profiles out so they do not hit the API together
     last_id = None
+    backfilled = False
     delay = 5
     while True:
         try:
-            if last_id is None:
+            if not backfilled:
+                backfilled = True  # one attempt only; never restart the whole backfill after a failure
                 last_id = nextdns_backfill(profile)
             params = {"id": last_id} if last_id else {}
             with nextdns_open(f"{profile}/logs/stream", params) as resp:
@@ -565,8 +588,8 @@ def run_server():
     Handler.providers = tuple(names)
     ENABLED[:] = [n for n in names if PROVIDERS[n].get("suffixes")]
     if NEXTDNS_API_KEY and NEXTDNS_PROFILES:
-        for profile in NEXTDNS_PROFILES:
-            threading.Thread(target=nextdns_watch, args=(profile,), daemon=True).start()
+        for i, profile in enumerate(NEXTDNS_PROFILES):
+            threading.Thread(target=nextdns_watch, args=(profile, i * 5), daemon=True).start()
             if NEXTDNS_POLL_MINUTES > 0:
                 threading.Thread(target=nextdns_poll, args=(profile,), daemon=True).start()
     elif NEXTDNS_API_KEY or NEXTDNS_PROFILES:
