@@ -31,7 +31,7 @@ Environment variables:
                    watch your NextDNS profile(s) (comma separated ids) for lookups of a
                    provider's domains (e.g. *.apple.com) via the logs + stream API. Needs
                    logging enabled on the profile. New domains are resolved straight away.
-    NEXTDNS_POLL_MINUTES  also re-read recent logs this often as a safety net (default: 15)
+    NEXTDNS_POLL_MINUTES  also re-read recent logs this often in case the stream stalls (default: 0 = off)
     INGEST_TOKEN   enables POST /ingest/<provider>; send "Authorization: Bearer <token>"
                    and a body of "<ip> <hostname>" lines. Only hostnames that belong to
                    the provider (e.g. *.apple.com) are accepted.
@@ -75,7 +75,7 @@ INGEST_TOKEN = os.getenv("INGEST_TOKEN", "")
 MAX_INGEST_BYTES = 256_000
 NEXTDNS_API_KEY = os.getenv("NEXTDNS_API_KEY", "")
 NEXTDNS_API = os.getenv("NEXTDNS_API_URL", "https://api.nextdns.io")
-NEXTDNS_POLL_MINUTES = float(os.getenv("NEXTDNS_POLL_MINUTES", "15"))
+NEXTDNS_POLL_MINUTES = float(os.getenv("NEXTDNS_POLL_MINUTES", "0"))
 NEXTDNS_PROFILES = [x.strip() for x in os.getenv("NEXTDNS_PROFILES", "").split(",") if x.strip()]
 
 RETRY_SECONDS = 600
@@ -567,7 +567,8 @@ def run_server():
     if NEXTDNS_API_KEY and NEXTDNS_PROFILES:
         for profile in NEXTDNS_PROFILES:
             threading.Thread(target=nextdns_watch, args=(profile,), daemon=True).start()
-            threading.Thread(target=nextdns_poll, args=(profile,), daemon=True).start()
+            if NEXTDNS_POLL_MINUTES > 0:
+                threading.Thread(target=nextdns_poll, args=(profile,), daemon=True).start()
     elif NEXTDNS_API_KEY or NEXTDNS_PROFILES:
         log.warning("NextDNS needs both NEXTDNS_API_KEY and NEXTDNS_PROFILES; ignoring")
     log.info("serving %s on :%d (prefix=%r), refresh every %sh", ",".join(names), PORT, PATH_PREFIX, REFRESH_HOURS)
