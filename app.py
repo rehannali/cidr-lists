@@ -31,7 +31,9 @@ Environment variables:
                    watch your NextDNS profile(s) (comma separated ids) for lookups of a
                    provider's domains (e.g. *.apple.com) via the logs + stream API. Needs
                    logging enabled on the profile. New domains are resolved straight away.
-    NEXTDNS_POLL_MINUTES  also re-read recent logs this often in case the stream stalls (default: 0 = off)
+    NEXTDNS_POLL_MINUTES  how often to ask the logs API for new lookups (default: 1; 0 = off)
+    NEXTDNS_STREAM        1 = also follow the live log stream (default: 0; NextDNS closes the
+                          stream after ~20s and rate limits reconnects, so polling is the main path)
     INGEST_TOKEN   enables POST /ingest/<provider>; send "Authorization: Bearer <token>"
                    and a body of "<ip> <hostname>" lines. Only hostnames that belong to
                    the provider (e.g. *.apple.com) are accepted.
@@ -52,6 +54,7 @@ import json
 import socket
 import logging
 import os
+import random
 import concurrent.futures
 import hmac
 import sqlite3
@@ -76,7 +79,8 @@ INGEST_TOKEN = os.getenv("INGEST_TOKEN", "")
 MAX_INGEST_BYTES = 256_000
 NEXTDNS_API_KEY = os.getenv("NEXTDNS_API_KEY", "")
 NEXTDNS_API = os.getenv("NEXTDNS_API_URL", "https://api.nextdns.io")
-NEXTDNS_POLL_MINUTES = float(os.getenv("NEXTDNS_POLL_MINUTES", "0"))
+NEXTDNS_POLL_MINUTES = float(os.getenv("NEXTDNS_POLL_MINUTES", "1"))
+NEXTDNS_STREAM = os.getenv("NEXTDNS_STREAM", "0").lower() in ("1", "true", "yes")
 NEXTDNS_PROFILES = [x.strip() for x in os.getenv("NEXTDNS_PROFILES", "").split(",") if x.strip()]
 
 RETRY_SECONDS = 600
@@ -445,15 +449,25 @@ def nextdns_backfill(profile, since="-1d"):
     return stream_id
 
 
-def nextdns_poll(profile):
-    """Safety net in case the stream stalls: re-read recent logs now and then."""
+def _iso(ts):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+
+
+def nextdns_poll(profile, start_delay=0):
+    """Every NEXTDNS_POLL_MINUTES ask the logs API for the provider domains seen since the last
+    successful poll (with a little overlap; known domains are ignored)."""
+    time.sleep(start_delay)  # spread several profiles out so they do not hit the API together
+    interval = NEXTDNS_POLL_MINUTES * 60
+    # the stream, when enabled, does its own one-day catch-up
+    since = _iso(time.time() - 2 * interval) if NEXTDNS_STREAM else "-1d"
     while True:
-        time.sleep(NEXTDNS_POLL_MINUTES * 60)
-        since = time.time() - 2 * NEXTDNS_POLL_MINUTES * 60
+        started = time.time()
         try:
-            nextdns_backfill(profile, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since)))
+            nextdns_backfill(profile, since)
+            since = _iso(started - 30)
         except Exception as exc:  # noqa: BLE001
-            log.error("nextdns %s: poll failed: %s", profile, exc)
+            log.error("nextdns %s: poll failed: %s (will retry from the same point)", profile, exc)
+        time.sleep(max(interval - (time.time() - started), 5))
 
 
 def nextdns_watch(profile, start_delay=0):
@@ -462,29 +476,39 @@ def nextdns_watch(profile, start_delay=0):
     backfilled = False
     delay = 5
     while True:
+        started = time.time()
+        events = 0
         try:
             if not backfilled:
                 backfilled = True  # one attempt only; never restart the whole backfill after a failure
                 last_id = nextdns_backfill(profile)
             params = {"id": last_id} if last_id else {}
-            with nextdns_open(f"{profile}/logs/stream", params) as resp:
+            started = time.time()
+            with nextdns_open(f"{profile}/logs/stream", params, retries=0) as resp:
                 log.info("nextdns %s: streaming", profile)
-                delay = 5
                 for raw in resp:
                     line = raw.decode("utf-8", "replace").strip()
                     if line.startswith("id:"):
                         last_id = line[3:].strip()
                     elif line.startswith("data:"):
+                        events += 1
                         try:
                             domain = json.loads(line[5:]).get("domain")
                         except ValueError:
                             continue
                         if domain:
                             nextdns_domain(domain)
+            reason = "closed by server"
         except Exception as exc:  # noqa: BLE001
-            log.error("nextdns %s: %s (retry in %ss)", profile, exc, delay)
-        time.sleep(delay)
-        delay = min(delay * 2, 300)
+            reason = str(exc)
+        lived = time.time() - started
+        # A stream that stayed up a while is healthy: reconnect soon. One that dies quickly
+        # (or is rate limited) backs off, so a flapping stream cannot hammer the API.
+        delay = 5 if lived >= 60 else min(max(delay * 2, 30), 300)
+        wait = delay + random.uniform(0, 10)
+        log.warning("nextdns %s: stream ended after %.0fs, %d events (%s); reconnecting in %.0fs",
+                    profile, lived, events, reason, wait)
+        time.sleep(wait)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -589,9 +613,10 @@ def run_server():
     ENABLED[:] = [n for n in names if PROVIDERS[n].get("suffixes")]
     if NEXTDNS_API_KEY and NEXTDNS_PROFILES:
         for i, profile in enumerate(NEXTDNS_PROFILES):
-            threading.Thread(target=nextdns_watch, args=(profile, i * 5), daemon=True).start()
+            if NEXTDNS_STREAM:
+                threading.Thread(target=nextdns_watch, args=(profile, i * 5), daemon=True).start()
             if NEXTDNS_POLL_MINUTES > 0:
-                threading.Thread(target=nextdns_poll, args=(profile,), daemon=True).start()
+                threading.Thread(target=nextdns_poll, args=(profile, i * 5), daemon=True).start()
     elif NEXTDNS_API_KEY or NEXTDNS_PROFILES:
         log.warning("NextDNS needs both NEXTDNS_API_KEY and NEXTDNS_PROFILES; ignoring")
     log.info("serving %s on :%d (prefix=%r), refresh every %sh", ",".join(names), PORT, PATH_PREFIX, REFRESH_HOURS)

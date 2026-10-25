@@ -25,10 +25,13 @@ Only hostnames under Apple's domains and public IPs are accepted.
 
 ### Learning from NextDNS
 Set `NEXTDNS_API_KEY` and `NEXTDNS_PROFILES` (comma separated profile ids) and enable logging on the
-profile. The server reads the last day of logs, then follows the live log stream (resuming after any
-disconnect). Set `NEXTDNS_POLL_MINUTES` to also re-read recent logs periodically in case the stream
-stalls (off by default). Logs themselves are never stored; only matching domains and their IPs are. Every queried domain under Apple's domains is remembered and resolved immediately, and
-its IPs are added to the list; remembered domains are re-resolved every `RESOLVE_MINUTES`.
+profile. The server reads the last day of logs, then asks the logs API for new Apple lookups every
+`NEXTDNS_POLL_MINUTES` (default 1). Every queried domain under Apple's domains is remembered and
+resolved immediately, and its IPs are added to the list; remembered domains are re-resolved every
+`RESOLVE_MINUTES`. Logs themselves are never stored; only matching domains and their IPs are.
+
+`NEXTDNS_STREAM=1` additionally follows the live log stream. It is off by default: NextDNS closes the
+stream after about 20 seconds and rate limits reconnects (HTTP 429), so polling is more dependable.
 
 NextDNS logs contain the queried domain but not the answer IPs, so the IPs come from this server's own
 DNS lookups and can differ from what a client was given by a CDN.

@@ -19,8 +19,11 @@ services:
       # Both are needed together.
       NEXTDNS_API_KEY: ${NEXTDNS_API_KEY:-}
       NEXTDNS_PROFILES: ${NEXTDNS_PROFILES:-}
-      # 0 = off. Set e.g. 15 to also re-read recent logs in case the stream stalls.
-      NEXTDNS_POLL_MINUTES: ${NEXTDNS_POLL_MINUTES:-0}
+      # How often to ask the logs API for new lookups (minutes; 0 = off)
+      NEXTDNS_POLL_MINUTES: ${NEXTDNS_POLL_MINUTES:-1}
+      # 1 = also follow the live stream. NextDNS closes it after ~20s and rate limits
+      # reconnects, so it is off by default.
+      NEXTDNS_STREAM: ${NEXTDNS_STREAM:-0}
 
       # Optional overrides; empty = built-in defaults
       APPLE_HOSTS: ${APPLE_HOSTS:-}
