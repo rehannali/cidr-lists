@@ -5,6 +5,9 @@ services:
     environment:
       REFRESH_HOURS: "24"
       PROVIDERS: "telegram,google,apple"
+      # Optional: learn Apple domains from your NextDNS logs (logging must be on for the profile)
+      # NEXTDNS_API_KEY: "your-api-key"
+      # NEXTDNS_PROFILES: "abc123"
       # Optional: lets pfSense report IPs it saw (see scripts/pfsense-ingest.sh)
       # INGEST_TOKEN: "long-random-string"
       # Optional: serve under a secret path, e.g. https://cidr.example.com/k3x9q2/telegram/v4.txt

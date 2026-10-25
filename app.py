@@ -27,6 +27,11 @@ Environment variables:
                    apple has a built-in set (developer.apple.com, idmsa.apple.com, ...)
     RESOLVE_MINUTES  how often hostnames are re-resolved   (default: 30)
     EXPIRE_DAYS      forget learned IPs not seen for this long, 0 = never  (default: 90)
+    NEXTDNS_API_KEY, NEXTDNS_PROFILES
+                   watch your NextDNS profile(s) (comma separated ids) for lookups of a
+                   provider's domains (e.g. *.apple.com) via the logs + stream API. Needs
+                   logging enabled on the profile. New domains are resolved straight away.
+    NEXTDNS_POLL_MINUTES  also re-read recent logs this often as a safety net (default: 15)
     INGEST_TOKEN   enables POST /ingest/<provider>; send "Authorization: Bearer <token>"
                    and a body of "<ip> <hostname>" lines. Only hostnames that belong to
                    the provider (e.g. *.apple.com) are accepted.
@@ -47,12 +52,14 @@ import json
 import socket
 import logging
 import os
+import concurrent.futures
 import hmac
 import sqlite3
 import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -66,6 +73,10 @@ RESOLVE_MINUTES = float(os.getenv("RESOLVE_MINUTES", "30"))
 EXPIRE_DAYS = float(os.getenv("EXPIRE_DAYS", "90"))
 INGEST_TOKEN = os.getenv("INGEST_TOKEN", "")
 MAX_INGEST_BYTES = 256_000
+NEXTDNS_API_KEY = os.getenv("NEXTDNS_API_KEY", "")
+NEXTDNS_API = os.getenv("NEXTDNS_API_URL", "https://api.nextdns.io")
+NEXTDNS_POLL_MINUTES = float(os.getenv("NEXTDNS_POLL_MINUTES", "15"))
+NEXTDNS_PROFILES = [x.strip() for x in os.getenv("NEXTDNS_PROFILES", "").split(",") if x.strip()]
 
 RETRY_SECONDS = 600
 MAX_BYTES = 20_000_000
@@ -174,6 +185,10 @@ def db(out):
         "CREATE TABLE IF NOT EXISTS seen (provider TEXT, ip TEXT, host TEXT, first_seen INTEGER,"
         " last_seen INTEGER, PRIMARY KEY (provider, ip))"
     )
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS names (provider TEXT, host TEXT, first_seen INTEGER,"
+        " last_seen INTEGER, PRIMARY KEY (provider, host))"
+    )
     return con
 
 
@@ -200,8 +215,32 @@ def record(name, pairs, out):
             expired = con.execute(
                 "DELETE FROM seen WHERE provider=? AND last_seen<?", (name, now - int(EXPIRE_DAYS * 86400))
             ).rowcount
+            con.execute(
+                "DELETE FROM names WHERE provider=? AND last_seen<?", (name, now - int(EXPIRE_DAYS * 86400))
+            )
     con.close()
     return new, expired
+
+
+def remember_name(name, host, out):
+    """Remember a domain seen in DNS logs. Returns True if it is new."""
+    now = int(time.time())
+    with LOCK, db(out) as con:
+        cur = con.execute("UPDATE names SET last_seen=? WHERE provider=? AND host=?", (now, name, host))
+        if cur.rowcount:
+            new = False
+        else:
+            con.execute("INSERT INTO names VALUES (?,?,?,?)", (name, host, now, now))
+            new = True
+    con.close()
+    return new
+
+
+def known_names(name, out):
+    with LOCK, db(out) as con:
+        rows = con.execute("SELECT host FROM names WHERE provider=?", (name,)).fetchall()
+    con.close()
+    return [r[0] for r in rows]
 
 
 def learned(name, out):
@@ -284,15 +323,20 @@ def asn_prefixes(asns):
     return text
 
 
-def resolve(name, out):
-    """Resolve the provider's hostnames and remember every IP. Returns True if files changed."""
-    pairs = []
-    for host in hosts(name):
-        try:
-            for info in socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP):
-                pairs.append((info[4][0], host))
-        except OSError as exc:
-            log.warning("%s: cannot resolve %s: %s", name, host, exc)
+def _lookup(host):
+    try:
+        return [(info[4][0], host) for info in socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)]
+    except OSError as exc:
+        log.warning("cannot resolve %s: %s", host, exc)
+        return []
+
+
+def resolve(name, out, only=None):
+    """Resolve hostnames (configured + seen in DNS logs) and remember every IP.
+    Returns True if files changed."""
+    targets = only or sorted(set(hosts(name)) | set(known_names(name, out)))
+    with concurrent.futures.ThreadPoolExecutor(8) as pool:
+        pairs = [pair for found in pool.map(_lookup, targets) for pair in found]
     new, expired = record(name, pairs, out)
     if new or expired:
         log.info("%s: learned %d new IPs, expired %d", name, new, expired)
@@ -337,6 +381,87 @@ def resolver(name):
         except Exception as exc:  # noqa: BLE001
             log.error("%s: resolve failed: %s", name, exc)
         stop.wait(RESOLVE_MINUTES * 60)
+
+
+ENABLED = []
+
+
+def nextdns_domain(domain):
+    """A domain seen in the logs: if it belongs to a provider, learn it and resolve it now."""
+    host = domain.rstrip(".").lower()
+    for name in ENABLED:
+        if any(host == s or host.endswith("." + s) for s in PROVIDERS[name].get("suffixes", [])):
+            if remember_name(name, host, OUT_DIR):
+                log.info("%s: new domain from NextDNS: %s", name, host)
+                if resolve(name, OUT_DIR, only=[host]):
+                    build(name, OUT_DIR)
+
+
+def nextdns_open(path, params):
+    query = urllib.parse.urlencode(params)
+    req = urllib.request.Request(
+        f"{NEXTDNS_API}/profiles/{path}?{query}",
+        headers={"X-Api-Key": NEXTDNS_API_KEY, "User-Agent": "cidr-mirror/1.0"},
+    )
+    return urllib.request.urlopen(req, timeout=300)
+
+
+def nextdns_backfill(profile, since="-1d"):
+    """Read logs since `since`. Returns the stream id to continue from."""
+    params = {"from": since, "limit": 1000}
+    stream_id = None
+    for _ in range(100):
+        with nextdns_open(f"{profile}/logs", params) as resp:
+            body = json.load(resp)
+        for entry in body.get("data", []):
+            if entry.get("domain"):
+                nextdns_domain(entry["domain"])
+        meta = body.get("meta") or {}
+        stream_id = stream_id or (meta.get("stream") or {}).get("id")
+        cursor = (meta.get("pagination") or {}).get("cursor")
+        if not cursor:
+            break
+        params["cursor"] = cursor
+    return stream_id
+
+
+def nextdns_poll(profile):
+    """Safety net in case the stream stalls: re-read recent logs now and then."""
+    while True:
+        time.sleep(NEXTDNS_POLL_MINUTES * 60)
+        since = time.time() - 2 * NEXTDNS_POLL_MINUTES * 60
+        try:
+            nextdns_backfill(profile, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since)))
+        except Exception as exc:  # noqa: BLE001
+            log.error("nextdns %s: poll failed: %s", profile, exc)
+
+
+def nextdns_watch(profile):
+    last_id = None
+    delay = 5
+    while True:
+        try:
+            if last_id is None:
+                last_id = nextdns_backfill(profile)
+            params = {"id": last_id} if last_id else {}
+            with nextdns_open(f"{profile}/logs/stream", params) as resp:
+                log.info("nextdns %s: streaming", profile)
+                delay = 5
+                for raw in resp:
+                    line = raw.decode("utf-8", "replace").strip()
+                    if line.startswith("id:"):
+                        last_id = line[3:].strip()
+                    elif line.startswith("data:"):
+                        try:
+                            domain = json.loads(line[5:]).get("domain")
+                        except ValueError:
+                            continue
+                        if domain:
+                            nextdns_domain(domain)
+        except Exception as exc:  # noqa: BLE001
+            log.error("nextdns %s: %s (retry in %ss)", profile, exc, delay)
+        time.sleep(delay)
+        delay = min(delay * 2, 300)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -438,6 +563,13 @@ def run_server():
         if hosts(name):
             threading.Thread(target=resolver, args=(name,), daemon=True).start()
     Handler.providers = tuple(names)
+    ENABLED[:] = [n for n in names if PROVIDERS[n].get("suffixes")]
+    if NEXTDNS_API_KEY and NEXTDNS_PROFILES:
+        for profile in NEXTDNS_PROFILES:
+            threading.Thread(target=nextdns_watch, args=(profile,), daemon=True).start()
+            threading.Thread(target=nextdns_poll, args=(profile,), daemon=True).start()
+    elif NEXTDNS_API_KEY or NEXTDNS_PROFILES:
+        log.warning("NextDNS needs both NEXTDNS_API_KEY and NEXTDNS_PROFILES; ignoring")
     log.info("serving %s on :%d (prefix=%r), refresh every %sh", ",".join(names), PORT, PATH_PREFIX, REFRESH_HOURS)
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 
