@@ -5,7 +5,7 @@ Mirrors vendor CIDR lists (Telegram, Google, Apple) for pfSense URL Table aliase
     https://<your-domain>/google/v4.txt
     https://<your-domain>/apple/v4.txt
 
-Sources: Telegram `cidr.txt`, Google `goog.json`, Apple's static allocation (17.0.0.0/8, 2620:149::/32).
+Sources: Telegram `cidr.txt`, Google `goog.txt`, Apple's static allocation (17.0.0.0/8, 2620:149::/32).
 Override any source with `<NAME>_URL`, limit providers with `PROVIDERS`, and hide the whole tree
 behind a secret path with `PATH_PREFIX`. See the docstring in `app.py`.
 

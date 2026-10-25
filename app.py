@@ -71,14 +71,12 @@ RETRY_SECONDS = 600
 MAX_BYTES = 20_000_000
 FILES = ("v4.txt", "v6.txt", "all.txt")
 
-# fmt: "text" = one CIDR per line (first comma field, '#' comments ignored)
-#      "google" = goog.json style {"prefixes": [{"ipv4Prefix"|"ipv6Prefix": ...}]}
+# Sources are text lists: one CIDR per line (first comma field; '#' comments ignored).
 # min_v4 / min_v6: sanity floor, rejects an upstream file that looks truncated.
 # fallback: written until the first successful fetch so the URL works immediately.
 PROVIDERS = {
     "telegram": {
         "url": "https://core.telegram.org/resources/cidr.txt",
-        "fmt": "text",
         "min_v4": 5,
         "min_v6": 2,
         "fallback": """
@@ -99,8 +97,7 @@ PROVIDERS = {
 """,
     },
     "google": {
-        "url": "https://www.gstatic.com/ipranges/goog.json",
-        "fmt": "google",
+        "url": "https://www.gstatic.com/ipranges/goog.txt",
         "min_v4": 10,
         "min_v6": 2,
         "fallback": "",
@@ -110,7 +107,6 @@ PROVIDERS = {
         # the prefixes announced by "asns" (RIPEstat) and every IP the "hosts" resolve to
         # (CDN-fronted services). Set APPLE_URL to use a text/CSV list as the base instead.
         "url": "",
-        "fmt": "text",
         "min_v4": 1,
         "min_v6": 0,
         "fallback": """
@@ -224,19 +220,13 @@ def _add(nets, value):
     nets[net.version].add(net)
 
 
-def parse(text, fmt="text"):
+def parse(text):
     """Return (sorted_v4, sorted_v6) networks from raw list content."""
     nets = {4: set(), 6: set()}
-    if fmt == "google":
-        for p in json.loads(text).get("prefixes", []):
-            value = p.get("ipv4Prefix") or p.get("ipv6Prefix")
-            if value:
-                _add(nets, value)
-    else:
-        for raw in text.splitlines():
-            line = raw.split("#", 1)[0].split(",", 1)[0].strip()
-            if line:
-                _add(nets, line)
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].split(",", 1)[0].strip()
+        if line:
+            _add(nets, line)
     return sorted(nets[4]), sorted(nets[6])
 
 
@@ -321,7 +311,7 @@ def refresh(name, out):
         url = source_url(name)
         text = fetch(url) if url else PROVIDERS[name]["fallback"]
         text += asn_prefixes(PROVIDERS[name].get("asns", []))
-        v4, v6 = parse(text, PROVIDERS[name]["fmt"])
+        v4, v6 = parse(text)
         BASE[name] = (v4, v6)
         v4n, v6n = build(name, out)
     except Exception as exc:  # noqa: BLE001
@@ -424,7 +414,7 @@ def run_once(args):
     failed = False
     for name in names:
         if args.from_file:
-            BASE[name] = parse(Path(args.from_file).read_text(), PROVIDERS[name]["fmt"])
+            BASE[name] = parse(Path(args.from_file).read_text())
             v4n, v6n = build(name, out)
             print(f"{name}: wrote {v4n} IPv4 / {v6n} IPv6 ranges to {out}")
         elif not refresh(name, out):
