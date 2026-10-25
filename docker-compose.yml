@@ -2,10 +2,34 @@ services:
   tg-cidr:
     build: .
     restart: unless-stopped
+    # Compose only passes the variables listed here. Set the values in Dokploy's
+    # Environment tab (or a .env file); ${VAR:-default} is used when a value is not set.
     environment:
-      REFRESH_HOURS: "24"
-      # Optional: serve under a secret path, e.g. https://cidr.example.com/k3x9q2/telegram-v4.txt
-      # PATH_PREFIX: "k3x9q2"
+      # Lists to serve: telegram, google, apple
+      PROVIDERS: ${PROVIDERS:-telegram,google,apple}
+      # Optional secret path segment, e.g. "k3x9q2" -> https://cidr.example.com/k3x9q2/apple/v4.txt
+      PATH_PREFIX: ${PATH_PREFIX:-}
+
+      # Refresh intervals and expiry
+      REFRESH_HOURS: ${REFRESH_HOURS:-24}
+      RESOLVE_MINUTES: ${RESOLVE_MINUTES:-30}
+      EXPIRE_DAYS: ${EXPIRE_DAYS:-90}
+
+      # Learn Apple domains from your NextDNS logs (logging must be on for the profile).
+      # Both are needed together.
+      NEXTDNS_API_KEY: ${NEXTDNS_API_KEY:-}
+      NEXTDNS_PROFILES: ${NEXTDNS_PROFILES:-}
+      # 0 = off. Set e.g. 15 to also re-read recent logs in case the stream stalls.
+      NEXTDNS_POLL_MINUTES: ${NEXTDNS_POLL_MINUTES:-0}
+
+      # Optional overrides; empty = built-in defaults
+      APPLE_HOSTS: ${APPLE_HOSTS:-}
+      TELEGRAM_URL: ${TELEGRAM_URL:-}
+      GOOGLE_URL: ${GOOGLE_URL:-}
+      APPLE_URL: ${APPLE_URL:-}
+
+      # Enables POST /ingest/<provider> (see scripts/pfsense-ingest.sh); empty = off
+      INGEST_TOKEN: ${INGEST_TOKEN:-}
     volumes:
       - tg-cidr-data:/data
     # No "ports:" needed. In Dokploy, add a Domain pointing at container port 8080.
