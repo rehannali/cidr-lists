@@ -160,12 +160,12 @@ def enabled_providers():
 
 
 def source_url(name):
-    return os.getenv(f"{name.upper()}_URL", PROVIDERS[name]["url"])
+    return os.getenv(f"{name.upper()}_URL") or PROVIDERS[name]["url"]
 
 
 def hosts(name):
     env = os.getenv(f"{name.upper()}_HOSTS")
-    if env is not None:
+    if env:
         return [h.strip().lower() for h in env.split(",") if h.strip()]
     return PROVIDERS[name].get("hosts", [])
 
